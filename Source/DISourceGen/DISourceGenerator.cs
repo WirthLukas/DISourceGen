@@ -13,14 +13,10 @@ namespace DISourceGen
     [Generator]
     public class DISourceGenerator : ISourceGenerator
     {
-        private const string ServicesNamespace = "DI";
-        private const string ServicesTypeName = "Services";
-        private const string ServicesResolveMethodName = "Resolve";
         private const string FileName = "DISourceGen.Services.cs";
 
         private INamedTypeSymbol? _transientAttribute;
         private INamedTypeSymbol? _primaryConstructorAttribute;
-        private INamedTypeSymbol? _injectAttribute;
 
         public void Initialize(GeneratorInitializationContext context)
         {
@@ -28,30 +24,67 @@ namespace DISourceGen
 
         public void Execute(GeneratorExecutionContext context)
         {
+            try
+            {
+                string servicesClassSourceCode = BuildServicesClass(context);
+
+                // Adding source code that should be compiled and added to the .dll result
+                context.AddSource("TransientAttribute.cs", Types.TransientAttribute);
+                context.AddSource("PrimaryConstructorAttribute.cs", Types.PrimaryConstructorAttribute);
+                context.AddSource(FileName, servicesClassSourceCode);
+            }
+            catch (SourceGenException ex)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                        new DiagnosticDescriptor(ex.Id, ex.Title, ex.MessageFormat, ex.Category, DiagnosticSeverity.Error, true),
+                        Location.Create(FileName, new TextSpan(), new LinePositionSpan())                  
+                    ));
+            }
+        }
+
+        private string BuildServicesClass(GeneratorExecutionContext context)
+        {
             var compilation = AddOwnTypesToCompilation(context.Compilation);
 
-            context.AddSource("TransientAttribute.cs", Types.TransientAttribute);
-            context.AddSource("PrimaryConstructorAttribute.cs", Types.PrimaryConstructorAttribute);
+            _transientAttribute = compilation.GetTypeByMetadataName("DI.TransientAttribute")
+                ?? throw new SourceGenException("INTER001", "Type not found",
+                    $"Could not find 'DI.TransientAttribute' after adding it to the compilation.", "DISourceGenerator.cs");
 
-            _transientAttribute = compilation.GetTypeByMetadataName("DI.TransientAttribute");
-            _primaryConstructorAttribute = compilation.GetTypeByMetadataName("DI.PrimaryConstructorAttribute");
-            _injectAttribute = compilation.GetTypeByMetadataName("DI.InjectAttribute");
-            var servicesClass = compilation.GetTypeByMetadataName("DI.Services");
+            _primaryConstructorAttribute = compilation.GetTypeByMetadataName("DI.PrimaryConstructorAttribute")
+                ?? throw new SourceGenException("INTER001", "Type not found",
+                    $"Could not find 'DI.PrimaryConstructorAttribute' after adding it to the compilation.", "DISourceGenerator.cs");
 
+            var servicesClass = compilation.GetTypeByMetadataName("DI.Services")
+                ?? throw new SourceGenException("INTER001", "Type not found",
+                    $"Could not find 'DI.Services' after adding it to the compilation.", "DISourceGenerator.cs");
+
+            // all services that are needed in the program
+            // Key: Service Class name
+            // value: service data 
             var services = new Dictionary<string, ServiceData>();
 
+            // Get all type paramter types of all Services.Resolve<...>() calls
             foreach (var type in GetTypesToResolve(compilation, servicesClass))
             {
+                // Get Information for that service types 
                 MapToServiceData(type, services, compilation);
             }
 
+            // order services by their constructor argument number
+            // in order to avoid dependency issues, because needed field
+            // could be generated after the current service if the list is not sorted
             var orderedServices = services.Values
                 .OrderBy(service => service.ConstructorArguments.Count)
                 .ToList();
 
-            context.AddSource(FileName, GenerateServices(orderedServices));
+            return GenerateServices(orderedServices);
         }
-        
+
+        /// <summary>
+        /// Adds custom Types (Services.cs, Attributes) to the compilation
+        /// </summary>
+        /// <param name="compilation">compilation, where the types should be added</param>
+        /// <returns>new Compilation with types added</returns>
         private static Compilation AddOwnTypesToCompilation(Compilation compilation)
         {
             var options = (compilation as CSharpCompilation)?.SyntaxTrees[0].Options as CSharpParseOptions;
@@ -66,6 +99,43 @@ namespace DISourceGen
             return tempCompilation;
         }
 
+        /// <summary>
+        /// Returns all types, that are used as a type paramter in Services.Resolve<...> calls
+        /// (Duplicates possible)
+        /// </summary>
+        /// <param name="compilation">current compilation data</param>
+        /// <param name="servicesClass">Symbol for the services Class from the compilation</param>
+        /// <returns>List of service types (as Symbols)</returns>
+        private static IEnumerable<INamedTypeSymbol> GetTypesToResolve(Compilation compilation, INamedTypeSymbol servicesClass)
+        {
+            foreach (var syntaxTree in compilation.SyntaxTrees)
+            {
+                var semanticModel = compilation.GetSemanticModel(syntaxTree);
+
+                // Get All "DI.Services.Resolve<...>()"
+                var typesToCreate = syntaxTree.GetRoot().DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+                    .Select(ie => ModelExtensions.GetSymbolInfo(semanticModel, ie).Symbol as IMethodSymbol)      // Get All Methods Calls
+                    .Where(symbol => symbol is not null)     // exlude all non Method Symbols ('cause as returns null if it can not be casted)
+                    .Where(symbol => SymbolEqualityComparer.Default.Equals(symbol!.ContainingType, servicesClass))   // Of Services class
+                    .Select(symbol => symbol!.ReturnType as INamedTypeSymbol);
+
+                foreach (var type in typesToCreate)
+                {
+                    yield return type!;
+                }
+            }
+
+        }
+
+        /// <summary>
+        /// Collects recursivly the data (constructor arguments, implementaion, ...) for the given service type
+        /// 
+        /// if there is already data for this type in the services dictionary, then this data will be returned.
+        /// </summary>
+        /// <param name="type">type, where data should be collected</param>
+        /// <param name="services">Already created Services</param>
+        /// <param name="compilation"></param>
+        /// <returns>service data from the given type</returns>
         private ServiceData MapToServiceData(INamedTypeSymbol type, Dictionary<string, ServiceData> services, Compilation compilation)
         {
             // If there is already a service for this type, we reached the end of the recursion
@@ -74,6 +144,7 @@ namespace DISourceGen
                 return services[type.Name];
             }
 
+            // Is the type already a implementation?
             var realType = type.IsAbstract ? TypeUtils.FindImplementation(type, compilation) : type;
 
             if (realType is null)
@@ -96,10 +167,12 @@ namespace DISourceGen
             
             services.Add(type.Name, service);
 
+            // Collect Contructor arguments
             if (realType.Constructors.Length is not 0)
             {
+                // first public contructor in a class or a constructor with the [PrimaryConstructor] attribute
                 var ctor = realType.Constructors
-                    .Where(c => c.DeclaredAccessibility == Accessibility.Public)
+                    .Where(c => c.DeclaredAccessibility == Accessibility.Public)        // public contructors
                     .FirstOrDefault(c => c.GetAttributes()
                         .Any(ad => SymbolEqualityComparer.Default.Equals(ad.AttributeClass, _primaryConstructorAttribute)
                     )) ?? realType.Constructors[0];
@@ -108,6 +181,7 @@ namespace DISourceGen
                     .Select(p => p.Type)
                     .OfType<INamedTypeSymbol>())
                 {
+                    // Get the ServiceData from the parameter
                     service.ConstructorArguments.Add(MapToServiceData(paramType, services, compilation));
                 }
             }
@@ -115,6 +189,11 @@ namespace DISourceGen
             return service;
         }
 
+        /// <summary>
+        /// Creates source code for the Services class depending on the given services data
+        /// </summary>
+        /// <param name="services">data of the services that sould be supported</param>
+        /// <returns>source code for the Services class</returns>
         private static string GenerateServices(IList<ServiceData> services)
         {
             var sourceBuilder = new StringBuilder();
@@ -128,6 +207,7 @@ namespace DI
             // Field Generation
             var fields = GenerateFields(services, sourceBuilder);
 
+            // Method Resolve<T>
             sourceBuilder.AppendLine(@"
         public static T Resolve<T>()
         {");
@@ -231,27 +311,6 @@ namespace DI
                     first = false;
                 }
             }
-        }
-        
-        private static List<INamedTypeSymbol> GetTypesToResolve(Compilation compilation, INamedTypeSymbol servicesClass)
-        {
-            var types = new List<INamedTypeSymbol>();
-
-            foreach (var syntaxTree in compilation.SyntaxTrees)
-            {        
-                var semanticModel = compilation.GetSemanticModel(syntaxTree);
-
-                // Get All "DI.Services.Resolve<...>()"
-                var typesToCreate = syntaxTree.GetRoot().DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
-                    .Select(ie => ModelExtensions.GetSymbolInfo(semanticModel, ie).Symbol as IMethodSymbol)      // Get All Methods Calls
-                    .Where(symbol => symbol is not null)
-                    .Where(symbol => SymbolEqualityComparer.Default.Equals(symbol!.ContainingType, servicesClass))   // Of Services class
-                    .Select(symbol => symbol!.ReturnType as INamedTypeSymbol);
-
-                types.AddRange(typesToCreate!);
-            }
-
-            return types;
         }
  
         // Not working now, because the generated Resolve Method call, is not in the compilation context
